@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+transfer_debug.log
+*.flag
