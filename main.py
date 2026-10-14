@@ -30,15 +30,29 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8",
 )
 logger = logging.getLogger("order_transfer")
-BASE_SORT_OPTIONS = ("名前", "更新日時", "作成日時")
-MANUAL_SORT = "手動順"
+BASE_SORT_OPTIONS = ("名前", "拡張子", "ファイルサイズ", "更新日時", "作成日時", "アクセス日時")
 METADATA_SORT_TYPES = {
     "トラック番号": "number", "ディスク番号": "number", "タイトル": "text",
     "アルバム": "text", "アーティスト": "text", "ジャンル": "text",
     "作曲者": "text", "年": "number", "再生時間": "number",
-    "ビットレート": "number", "サンプルレート": "number",
-    "撮影日時": "date", "カメラ": "text", "画像サイズ": "text",
+    "ビットレート": "number", "総ビットレート": "number", "サンプルレート": "number",
+    "音声チャンネル数": "number", "音声形式": "text", "可変ビットレート": "text",
+    "音声ビット深度": "number",
+    "撮影日時": "date", "カメラ": "text", "カメラメーカー": "text",
+    "レンズ": "text", "ISO感度": "number", "F値": "number",
+    "露出時間": "number", "焦点距離": "number", "フラッシュ": "text",
+    "測光モード": "text", "向き": "text", "画像サイズ": "text",
     "画像の幅": "number", "画像の高さ": "number", "ページ数": "number",
+    "動画の幅": "number", "動画の高さ": "number", "フレームレート": "number",
+    "動画形式": "text", "FourCC": "text", "映像ビットレート": "number",
+    "動画の横比": "number", "動画の縦比": "number",
+    "画像のビット深度": "number", "画像の横解像度": "number", "画像の縦解像度": "number",
+    "画像形式": "text",
+    "立体視": "text",
+    "監督": "text", "作成者": "text", "件名": "text", "タグ": "text",
+    "コメント": "text", "単語数": "number", "文字数": "number",
+    "段落数": "number", "行数": "number", "スライド数": "number",
+    "改訂番号": "number", "プレゼンテーション形式": "text",
 }
 
 
@@ -250,7 +264,7 @@ class MtpOrderTransfer:
         sort_row.pack(fill="x")
         ttk.Label(sort_row, text="並び順:").pack(side="left")
         self.sort_by = tk.StringVar(value="名前")
-        self.sort_combo = ttk.Combobox(sort_row, textvariable=self.sort_by, values=BASE_SORT_OPTIONS + (MANUAL_SORT,),
+        self.sort_combo = ttk.Combobox(sort_row, textvariable=self.sort_by, values=BASE_SORT_OPTIONS,
                                        state="readonly", width=12)
         self.sort_combo.pack(side="left", padx=(6, 12))
         self.sort_combo.bind("<<ComboboxSelected>>", self._on_sort_selected)
@@ -967,8 +981,8 @@ class MtpOrderTransfer:
         self.metadata_by_path = {}
         self.metadata_request_id += 1
         self.metadata_loading = bool(self.source_files)
-        self.sort_combo.configure(values=BASE_SORT_OPTIONS + (MANUAL_SORT,))
-        if self.sort_by.get() not in BASE_SORT_OPTIONS + (MANUAL_SORT,):
+        self.sort_combo.configure(values=BASE_SORT_OPTIONS)
+        if self.sort_by.get() not in BASE_SORT_OPTIONS:
             self.sort_by.set("名前")
         self._update_preview()
         self.status.config(text="ファイルの共通メタデータを調べています…")
@@ -997,16 +1011,14 @@ class MtpOrderTransfer:
         for path in self.source_files:
             values = self.metadata_by_path.get(str(path), {})
             common.intersection_update(key for key in values if values[key] is not None and str(values[key]).strip())
-        options = BASE_SORT_OPTIONS + tuple(key for key in METADATA_SORT_TYPES if key in common) + (MANUAL_SORT,)
+        options = BASE_SORT_OPTIONS + tuple(key for key in METADATA_SORT_TYPES if key in common)
         self.sort_combo.configure(values=options)
         if self.sort_by.get() not in options:
             self.sort_by.set("名前")
-        self.direction_combo.config(state="disabled" if self.sort_by.get() == MANUAL_SORT or self.busy else "readonly")
+        self.direction_combo.config(state="disabled" if self.busy else "readonly")
 
     def _on_sort_selected(self, _event: tk.Event) -> None:
-        if self.sort_by.get() == MANUAL_SORT:
-            self.direction.set("昇順")
-        self.direction_combo.config(state="disabled" if self.sort_by.get() == MANUAL_SORT or self.busy else "readonly")
+        self.direction_combo.config(state="disabled" if self.busy else "readonly")
         self._update_preview()
 
     def _cleanup_archive_temp(self) -> None:
@@ -1028,15 +1040,19 @@ class MtpOrderTransfer:
                                  if message else f"共通メタデータを確認しました。並べ替え項目: {len(self.sort_combo['values'])} 種類"))
         self._refresh_transfer_button()
 
-    def _update_preview(self) -> None:
+    def _update_preview(self, preserve_order: bool = False) -> None:
         def natural_key(path: Path) -> tuple[tuple[int, object], ...]:
             parts = re.split(r"(\d+)", path.name.casefold())
             return tuple((1, int(part)) if part.isdigit() else (0, part) for part in parts)
 
         key = self.sort_by.get()
-        if key == MANUAL_SORT:
+        if preserve_order:
             files = [path for path in getattr(self, "ordered_files", []) if path in self.source_files]
             files.extend(path for path in self.source_files if path not in files)
+        elif key == "拡張子":
+            files = sorted(self.source_files, key=lambda p: (p.suffix.casefold(), natural_key(p)))
+        elif key == "ファイルサイズ":
+            files = sorted(self.source_files, key=lambda p: (self._safe_stat(p, "st_size"), natural_key(p)))
         elif key in METADATA_SORT_TYPES:
             value_type = METADATA_SORT_TYPES[key]
 
@@ -1058,9 +1074,11 @@ class MtpOrderTransfer:
             files = sorted(self.source_files, key=lambda p: (self._safe_stat_time(p, "st_mtime"), natural_key(p)))
         elif key == "作成日時":
             files = sorted(self.source_files, key=lambda p: (self._safe_stat_time(p, "st_ctime"), natural_key(p)))
+        elif key == "アクセス日時":
+            files = sorted(self.source_files, key=lambda p: (self._safe_stat_time(p, "st_atime"), natural_key(p)))
         else:
             files = sorted(self.source_files, key=natural_key)
-        if key != MANUAL_SORT and self.direction.get() == "降順":
+        if not preserve_order and self.direction.get() == "降順":
             files.reverse()
         self.ordered_files = files
         self.preview.delete(*self.preview.get_children())
@@ -1086,6 +1104,13 @@ class MtpOrderTransfer:
         try:
             return float(getattr(path.stat(), attribute))
         except OSError:
+            return float("inf")
+
+    @staticmethod
+    def _safe_stat(path: Path, attribute: str) -> int | float:
+        try:
+            return getattr(path.stat(), attribute)
+        except (OSError, AttributeError, TypeError, ValueError):
             return float("inf")
 
     @staticmethod
@@ -1243,8 +1268,7 @@ class MtpOrderTransfer:
             insert_index -= 1
         self.ordered_files.insert(insert_index, moved)
         self.last_moved_path = moved
-        self.sort_by.set(MANUAL_SORT)
-        self._on_sort_selected(event)
+        self._update_preview(preserve_order=True)
 
     def _clear_drag_overlay(self) -> None:
         if self.drag_overlay is not None:
@@ -1472,7 +1496,7 @@ class MtpOrderTransfer:
         self.new_folder_entry.config(state="normal" if not busy and self.destination_mode.get() == "new" else "disabled")
         combo_state = "disabled" if busy else "readonly"
         self.sort_combo.config(state=combo_state)
-        self.direction_combo.config(state="disabled" if busy or self.sort_by.get() == MANUAL_SORT else "readonly")
+        self.direction_combo.config(state="disabled" if busy else "readonly")
         self.refresh_button.config(state=state)
         self.transfer_button.config(state="disabled")
         # Preflight is also busy, but cancellation is only available after the
