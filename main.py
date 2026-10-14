@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import re
 import shutil
@@ -18,7 +19,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from pathlib import PurePosixPath
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -30,18 +31,32 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8",
 )
 logger = logging.getLogger("order_transfer")
+UI_SCALE = 1.0
+
+
+def _px(value: int | float | tuple[int | float, ...]) -> int | tuple[int, ...]:
+    if isinstance(value, tuple):
+        return tuple(round(part * UI_SCALE) for part in value)
+    return round(value * UI_SCALE)
+
+
 BASE_SORT_OPTIONS = ("名前", "拡張子", "ファイルサイズ", "更新日時", "作成日時", "アクセス日時")
+PREVIEWABLE_MEDIA_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".avif",
+    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aif", ".aiff",
+    ".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg", ".mpg", ".3gp", ".ts", ".m2ts",
+}
 METADATA_SORT_TYPES = {
     "トラック番号": "number", "ディスク番号": "number", "タイトル": "text",
     "アルバム": "text", "アーティスト": "text", "ジャンル": "text",
     "作曲者": "text", "年": "number", "再生時間": "number",
-    "ビットレート": "number", "総ビットレート": "number", "サンプルレート": "number",
+    "音声ビットレート": "number", "総ビットレート": "number", "サンプルレート": "number",
     "音声チャンネル数": "number", "音声形式": "text", "可変ビットレート": "text",
     "音声ビット深度": "number",
     "撮影日時": "date", "カメラ": "text", "カメラメーカー": "text",
     "レンズ": "text", "ISO感度": "number", "F値": "number",
     "露出時間": "number", "焦点距離": "number", "フラッシュ": "text",
-    "測光モード": "text", "向き": "text", "画像サイズ": "text",
+    "測光モード": "text", "向き": "text",
     "画像の幅": "number", "画像の高さ": "number", "ページ数": "number",
     "動画の幅": "number", "動画の高さ": "number", "フレームレート": "number",
     "動画形式": "text", "FourCC": "text", "映像ビットレート": "number",
@@ -103,6 +118,67 @@ def _count_present_wpd_interfaces() -> int | None:
         destroy_list(info_set)
 
 
+def _configure_windows_dpi_scaling() -> None:
+    """Make Tk render natively at the monitor DPI instead of bitmap-scaling the UI."""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_context = user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = wintypes.BOOL
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
+        if set_context(ctypes.c_void_p(-4)):
+            return
+        error = ctypes.get_last_error()
+        if error not in (87, 127):  # Invalid parameter / API unavailable on older Windows.
+            return
+    except (AttributeError, OSError):
+        pass
+
+    # Older Windows builds lack Per-Monitor V2. Use per-monitor awareness where
+    # available, then system awareness as a final fallback.
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        set_awareness = shcore.SetProcessDpiAwareness
+        set_awareness.argtypes = [ctypes.c_int]
+        set_awareness.restype = ctypes.c_long
+        set_awareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except (AttributeError, OSError):
+        try:
+            shcore = ctypes.WinDLL("shcore", use_last_error=True)
+            shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+        except (AttributeError, OSError):
+            try:
+                ctypes.WinDLL("user32", use_last_error=True).SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
+
+
+def _configure_tk_dpi(root: tk.Tk) -> None:
+    """Scale Tk's point-based fonts and the app's pixel-based layout together."""
+    global UI_SCALE
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_dpi = user32.GetDpiForWindow
+        get_dpi.argtypes = [wintypes.HWND]
+        get_dpi.restype = wintypes.UINT
+        dpi = int(get_dpi(root.winfo_id()))
+        if dpi <= 0:
+            return
+        UI_SCALE = dpi / 96.0
+        root.tk.call("tk", "scaling", 96.0 * UI_SCALE / 72.0)
+        style = ttk.Style(root)
+        default_font = tkfont.nametofont("TkDefaultFont")
+        # Add only a small amount of room for descenders in preview rows.
+        row_height = max(_px(24), default_font.metrics("linespace") + _px(4))
+        style.configure("Treeview", rowheight=row_height)
+    except (AttributeError, OSError, tk.TclError):
+        UI_SCALE = 1.0
+
+
 class MtpOrderTransfer:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -112,9 +188,9 @@ class MtpOrderTransfer:
             self.root.iconphoto(True, self.app_icon_image)
         except tk.TclError:
             self.app_icon_image = None
-        self.root.geometry("900x830")
-        self.root.minsize(900, 830)
-        self.root.maxsize(900, 830)
+        self.root.geometry(f"{_px(900)}x{_px(900)}")
+        self.root.minsize(_px(900), _px(900))
+        self.root.maxsize(_px(900), _px(900))
         self.events: queue.Queue[dict] = queue.Queue()
         self.bridge_errors: list[str] = []
         self.process: subprocess.Popen[str] | None = None
@@ -248,25 +324,25 @@ class MtpOrderTransfer:
         self.root.after(1800, self._finish_close)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=12)
+        outer = ttk.Frame(self.root, padding=_px(12))
         outer.pack(fill="both", expand=True)
 
-        source_box = ttk.LabelFrame(outer, text="1. 送信元（PCフォルダ／ZIP）", padding=10)
+        source_box = ttk.LabelFrame(outer, text="1. 送信元（PCフォルダ／ZIP）", padding=_px(10))
         source_box.pack(fill="x")
         self.source_label = ttk.Label(source_box, text="送信元が選択されていません", anchor="w")
         self.source_label.pack(side="left", fill="x", expand=True)
         self.source_button = ttk.Button(source_box, text="フォルダを選択…", command=self._choose_source_folder)
         self.zip_button = ttk.Button(source_box, text="ZIP／CBZを選択…", command=self._choose_source_zip)
-        self.zip_button.pack(side="right", padx=(0, 6))
+        self.zip_button.pack(side="right", padx=_px((0, 6)))
         self.source_button.pack(side="right")
 
-        sort_row = ttk.Frame(outer, padding=(0, 8, 0, 8))
+        sort_row = ttk.Frame(outer, padding=_px((0, 8, 0, 8)))
         sort_row.pack(fill="x")
         ttk.Label(sort_row, text="並び順:").pack(side="left")
         self.sort_by = tk.StringVar(value="名前")
         self.sort_combo = ttk.Combobox(sort_row, textvariable=self.sort_by, values=BASE_SORT_OPTIONS,
-                                       state="readonly", width=12)
-        self.sort_combo.pack(side="left", padx=(6, 12))
+                                       state="readonly", width=16)
+        self.sort_combo.pack(side="left", padx=_px((6, 12)))
         self.sort_combo.bind("<<ComboboxSelected>>", self._on_sort_selected)
         self.direction = tk.StringVar(value="昇順")
         self.direction_combo = ttk.Combobox(sort_row, textvariable=self.direction, values=("昇順", "降順"),
@@ -278,19 +354,19 @@ class MtpOrderTransfer:
         self.skip_box = ttk.Checkbutton(sort_row, text="同名ファイルをスキップ", variable=self.skip_existing)
         self.skip_box.pack(side="right")
         filter_row = ttk.Frame(outer)
-        filter_row.pack(fill="x", pady=(0, 6))
+        filter_row.pack(fill="x", pady=_px((0, 6)))
         ttk.Label(filter_row, text="拡張子:").pack(side="left")
         self.extension_filter = tk.StringVar(value="すべて")
         self.extension_combo = ttk.Combobox(filter_row, textvariable=self.extension_filter,
                                             values=("すべて",), state="readonly", width=14)
-        self.extension_combo.pack(side="left", padx=(6, 8))
+        self.extension_combo.pack(side="left", padx=_px((6, 8)))
         self.extension_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_extension_filter())
         ttk.Label(filter_row, text="プレビューの行をドラッグすると順番を変更できます").pack(side="left")
 
-        dest_box = ttk.LabelFrame(outer, text="2. USB接続したAndroidの転送先フォルダ", padding=10)
+        dest_box = ttk.LabelFrame(outer, text="2. USB接続したAndroidの転送先フォルダ", padding=_px(10))
         dest_box.pack(fill="both", expand=True)
         device_bar = ttk.Frame(dest_box)
-        device_bar.pack(fill="x", pady=(0, 8))
+        device_bar.pack(fill="x", pady=_px((0, 8)))
         self.connection_label = ttk.Label(device_bar, text="端末を検索しています…")
         self.connection_label.pack(side="left", fill="x", expand=True)
         self.refresh_button = ttk.Button(device_bar, text="再検索", command=self._refresh)
@@ -305,9 +381,9 @@ class MtpOrderTransfer:
         self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_select)
         self.folder_tree.bind("<<TreeviewOpen>>", self._on_folder_open)
         self.selected_destination = tk.StringVar(value="未選択（フォルダを1回クリック）")
-        ttk.Label(dest_box, textvariable=self.selected_destination, anchor="w", foreground="#1f4e79").pack(fill="x", pady=(8, 0))
+        ttk.Label(dest_box, textvariable=self.selected_destination, anchor="w", foreground="#1f4e79").pack(fill="x", pady=_px((8, 0)))
         destination_mode = ttk.Frame(dest_box)
-        destination_mode.pack(fill="x", pady=(6, 0))
+        destination_mode.pack(fill="x", pady=_px((6, 0)))
         self.destination_mode = tk.StringVar(value="existing")
         self.existing_mode_radio = ttk.Radiobutton(destination_mode, text="選択したフォルダへ転送",
                                                    variable=self.destination_mode, value="existing",
@@ -316,23 +392,25 @@ class MtpOrderTransfer:
         self.new_mode_radio = ttk.Radiobutton(destination_mode, text="新しいフォルダを作成して転送",
                                               variable=self.destination_mode, value="new",
                                               command=self._on_destination_mode)
-        self.new_mode_radio.pack(side="left", padx=(12, 6))
+        self.new_mode_radio.pack(side="left", padx=_px((12, 6)))
         self.new_folder_name = tk.StringVar()
         self.new_folder_name.trace_add("write", lambda *_args: self._refresh_transfer_button())
         self.new_folder_entry = ttk.Entry(destination_mode, textvariable=self.new_folder_name, width=28, state="disabled")
         self.new_folder_entry.pack(side="left", fill="x", expand=True)
 
-        preview_box = ttk.LabelFrame(outer, text="3. 転送順プレビュー", padding=8)
-        preview_box.pack(fill="both", expand=True, pady=(10, 0))
+        preview_box = ttk.LabelFrame(outer, text="3. 転送順プレビュー（メディアはダブルクリックで開く）", padding=_px(8))
+        preview_box.pack(fill="both", expand=True, pady=_px((10, 0)))
         preview_frame = ttk.Frame(preview_box)
         preview_frame.pack(fill="both", expand=True)
-        self.preview = ttk.Treeview(preview_frame, columns=("order", "name", "size"), show="headings", height=10)
+        self.preview = ttk.Treeview(preview_frame, columns=("order", "name", "sort_value", "size"), show="headings", height=10)
         self.preview.heading("order", text="順番")
         self.preview.heading("name", text="ファイル名")
+        self.preview.heading("sort_value", text="並び替え値")
         self.preview.heading("size", text="サイズ")
-        self.preview.column("order", width=58, anchor="center", stretch=False)
-        self.preview.column("name", width=540, anchor="w")
-        self.preview.column("size", width=100, anchor="e", stretch=False)
+        self.preview.column("order", width=_px(58), anchor="center", stretch=False)
+        self.preview.column("name", width=_px(380), anchor="w")
+        self.preview.column("sort_value", width=_px(300), anchor="w")
+        self.preview.column("size", width=_px(96), anchor="e", stretch=False)
         self.preview.pack(side="left", fill="both", expand=True)
         pscroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview.yview)
         pscroll.pack(side="right", fill="y")
@@ -340,32 +418,33 @@ class MtpOrderTransfer:
         self.preview.bind("<ButtonPress-1>", self._preview_drag_start, add="+")
         self.preview.bind("<B1-Motion>", self._preview_drag_motion, add="+")
         self.preview.bind("<ButtonRelease-1>", self._preview_drag_end, add="+")
+        self.preview.bind("<Double-1>", self._open_preview_media, add="+")
 
         self.reverse_transfer = tk.BooleanVar(value=False)
         self.reverse_transfer_box = ttk.Checkbutton(outer, text="下から転送", variable=self.reverse_transfer)
-        self.reverse_transfer_box.pack(anchor="w", pady=(5, 0))
+        self.reverse_transfer_box.pack(anchor="w", pady=_px((5, 0)))
 
-        bottom = ttk.Frame(outer, padding=(0, 10, 0, 0))
+        bottom = ttk.Frame(outer, padding=_px((0, 10, 0, 0)))
         bottom.pack(fill="x")
         self.status = ttk.Label(bottom, text="USB接続後、端末側でファイル転送を許可してください。")
         self.status.pack(fill="x")
         progress_row = ttk.Frame(bottom)
-        progress_row.pack(fill="x", pady=(5, 0))
+        progress_row.pack(fill="x", pady=_px((5, 0)))
         self.metrics_text = ttk.Label(progress_row, text="経過 --:-- | 平均速度 -- | 残り目安 --", width=46, anchor="w")
-        self.metrics_text.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.metrics_text.grid(row=0, column=0, sticky="w", padx=_px((0, 8)))
         self.transfer_button = ttk.Button(progress_row, text="順番に転送", command=self._transfer, state="disabled", width=12)
         self.transfer_button.grid(row=0, column=1, sticky="ew")
         self.cancel_button = ttk.Button(progress_row, text="中止", command=self._cancel_transfer, state="disabled", width=9)
-        self.cancel_button.grid(row=0, column=2, sticky="ew", padx=(8, 8))
-        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate", maximum=100, length=150)
+        self.cancel_button.grid(row=0, column=2, sticky="ew", padx=_px((8, 8)))
+        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate", maximum=100, length=_px(150))
         self.progress_bar.grid(row=0, column=3, sticky="ew")
         self.progress_text = ttk.Label(progress_row, text="0%", width=34, anchor="e")
-        self.progress_text.grid(row=0, column=4, sticky="e", padx=(8, 0))
+        self.progress_text.grid(row=0, column=4, sticky="e", padx=_px((8, 0)))
         progress_row.columnconfigure(0, weight=1)
-        progress_row.columnconfigure(1, minsize=104)
-        progress_row.columnconfigure(2, minsize=88)
-        progress_row.columnconfigure(3, minsize=150, weight=0)
-        progress_row.columnconfigure(4, minsize=220)
+        progress_row.columnconfigure(1, minsize=_px(104))
+        progress_row.columnconfigure(2, minsize=_px(88))
+        progress_row.columnconfigure(3, minsize=_px(150), weight=0)
+        progress_row.columnconfigure(4, minsize=_px(220))
 
     def _start_bridge(self) -> None:
         logger.info("app_start app_dir=%s", APP_DIR)
@@ -718,15 +797,15 @@ class MtpOrderTransfer:
 
         window = tk.Toplevel(self.root)
         window.title("転送結果")
-        window.geometry("680x500")
+        window.geometry(f"{_px(680)}x{_px(500)}")
         window.transient(self.root)
-        frame = ttk.Frame(window, padding=12)
+        frame = ttk.Frame(window, padding=_px(12))
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=summary, font=("Segoe UI", 10, "bold")).pack(anchor="w")
         if detail:
-            ttk.Label(frame, text=detail, wraplength=640, justify="left").pack(anchor="w", pady=(6, 10))
+            ttk.Label(frame, text=detail, wraplength=_px(640), justify="left").pack(anchor="w", pady=_px((6, 10)))
         else:
-            ttk.Label(frame, text="一覧は転送順です。",).pack(anchor="w", pady=(4, 10))
+            ttk.Label(frame, text="一覧は転送順です。",).pack(anchor="w", pady=_px((4, 10)))
 
         table_frame = ttk.Frame(frame)
         table_frame.pack(fill="both", expand=True)
@@ -736,17 +815,17 @@ class MtpOrderTransfer:
         table.heading("status", text="結果")
         table.heading("name", text="ファイル名")
         table.heading("size", text="サイズ")
-        table.column("order", width=48, anchor="e")
-        table.column("status", width=100, anchor="center")
-        table.column("name", width=400, anchor="w")
-        table.column("size", width=90, anchor="e")
+        table.column("order", width=_px(48), anchor="e")
+        table.column("status", width=_px(100), anchor="center")
+        table.column("name", width=_px(400), anchor="w")
+        table.column("size", width=_px(90), anchor="e")
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=table.yview)
         table.configure(yscrollcommand=scrollbar.set)
         table.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         for index, result in enumerate(self.transfer_results, 1):
             table.insert("", "end", values=(index, result["status"], result["name"], result["size"]))
-        ttk.Button(frame, text="閉じる", command=window.destroy).pack(anchor="e", pady=(10, 0))
+        ttk.Button(frame, text="閉じる", command=window.destroy).pack(anchor="e", pady=_px((10, 0)))
 
     def _show_folders(self, folders: list[dict]) -> None:
         self.folders = folders
@@ -981,7 +1060,7 @@ class MtpOrderTransfer:
         self.metadata_by_path = {}
         self.metadata_request_id += 1
         self.metadata_loading = bool(self.source_files)
-        self.sort_combo.configure(values=BASE_SORT_OPTIONS)
+        self.sort_combo.configure(values=BASE_SORT_OPTIONS, width=16)
         if self.sort_by.get() not in BASE_SORT_OPTIONS:
             self.sort_by.set("名前")
         self._update_preview()
@@ -1012,7 +1091,8 @@ class MtpOrderTransfer:
             values = self.metadata_by_path.get(str(path), {})
             common.intersection_update(key for key in values if values[key] is not None and str(values[key]).strip())
         options = BASE_SORT_OPTIONS + tuple(key for key in METADATA_SORT_TYPES if key in common)
-        self.sort_combo.configure(values=options)
+        longest = max((len(option) for option in options), default=6)
+        self.sort_combo.configure(values=options, width=max(12, min(36, longest * 2 + 1)))
         if self.sort_by.get() not in options:
             self.sort_by.set("名前")
         self.direction_combo.config(state="disabled" if self.busy else "readonly")
@@ -1041,11 +1121,15 @@ class MtpOrderTransfer:
         self._refresh_transfer_button()
 
     def _update_preview(self, preserve_order: bool = False) -> None:
-        def natural_key(path: Path) -> tuple[tuple[int, object], ...]:
-            parts = re.split(r"(\d+)", path.name.casefold())
+        def natural_key(value: str | Path) -> tuple[tuple[int, object], ...]:
+            text = value.name if isinstance(value, Path) else value
+            parts = re.split(r"(\d+)", text.casefold())
             return tuple((1, int(part)) if part.isdigit() else (0, part) for part in parts)
 
         key = self.sort_by.get()
+        value_heading = f"値: {key}"
+        self.preview.heading("sort_value", text=value_heading)
+        self.preview.column("sort_value", width=_px(max(210, min(300, len(value_heading) * 17 + 24))))
         if preserve_order:
             files = [path for path in getattr(self, "ordered_files", []) if path in self.source_files]
             files.extend(path for path in self.source_files if path not in files)
@@ -1067,7 +1151,7 @@ class MtpOrderTransfer:
                         return (0, datetime.fromisoformat(text).timestamp())
                     except (ValueError, OSError):
                         return (1, 0)
-                return (0, natural_key(Path(str(raw))))
+                return (0, natural_key(str(raw)))
 
             files = sorted(self.source_files, key=lambda p: (metadata_key(p), natural_key(p)))
         elif key == "更新日時":
@@ -1090,9 +1174,11 @@ class MtpOrderTransfer:
                 size = -1
             relative = self.relative_paths.get(str(path), "")
             label = f"{relative}/{path.name}" if relative else path.name
+            sort_value = self._format_sort_value(path, key, size)
             row = f"preview_{index}"
             self.preview.insert("", "end", iid=row,
-                                values=(f"{index:03d}", label, "ファイルが見つかりません" if size < 0 else self._format_size(size)))
+                                values=(f"{index:03d}", label, sort_value,
+                                        "ファイルが見つかりません" if size < 0 else self._format_size(size)))
             if path == self.last_moved_path:
                 moved_row = row
         if moved_row:
@@ -1105,6 +1191,79 @@ class MtpOrderTransfer:
             return float(getattr(path.stat(), attribute))
         except OSError:
             return float("inf")
+
+    def _format_sort_value(self, path: Path, key: str, size: int) -> str:
+        if key == "名前":
+            return path.name
+        if key == "拡張子":
+            return path.suffix or "拡張子なし"
+        if key == "ファイルサイズ":
+            return "値なし" if size < 0 else self._format_size(size)
+        time_attributes = {"更新日時": "st_mtime", "作成日時": "st_ctime", "アクセス日時": "st_atime"}
+        if key in time_attributes:
+            stamp = self._safe_stat_time(path, time_attributes[key])
+            if stamp == float("inf"):
+                return "値なし"
+            try:
+                return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                return "値なし"
+
+        raw = self.metadata_by_path.get(str(path), {}).get(key)
+        if raw is None or not str(raw).strip():
+            return "値なし"
+        text = str(raw).strip()
+        if key == "再生時間":
+            if ":" in text:
+                return text
+            number = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+            if number:
+                duration = float(number.group(0))
+                if duration >= 100_000:
+                    duration /= 10_000_000  # Windows System.Media.Duration is in 100-ns units.
+                return self._format_duration(duration)
+        if key == "フレームレート":
+            number = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+            if number:
+                return f"{float(number.group(0)) / 1000:g} fps"
+        if key in {"音声ビットレート", "総ビットレート", "映像ビットレート"}:
+            number = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+            if number:
+                return f"{float(number.group(0)) / 1000:g} kbps"
+        if key == "サンプルレート":
+            return f"{text} Hz"
+        if key in {"動画の幅", "動画の高さ", "画像の幅", "画像の高さ"}:
+            return f"{text} px"
+        if METADATA_SORT_TYPES.get(key) == "date":
+            try:
+                stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return stamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, OSError, OverflowError):
+                pass
+        return text
+
+    def _open_preview_media(self, event: tk.Event) -> str | None:
+        row = self.preview.identify_row(event.y)
+        if not row:
+            return "break"
+        try:
+            index = int(row.removeprefix("preview_")) - 1
+            path = self.ordered_files[index]
+        except (ValueError, IndexError, AttributeError):
+            return "break"
+        if path.suffix.casefold() not in PREVIEWABLE_MEDIA_EXTENSIONS:
+            self.status.config(text="安全のため、画像・音声・動画ファイルだけ開けます。")
+            return "break"
+        if not path.is_file():
+            self.status.config(text="選択したメディアファイルが見つかりません。")
+            return "break"
+        try:
+            os.startfile(str(path))
+            self.status.config(text=f"既定のアプリで開きました: {path.name}")
+        except OSError as exc:
+            logger.warning("Could not open preview media %s: %s", path, exc)
+            self.status.config(text=f"メディアを開けませんでした: {path.name}")
+        return "break"
 
     @staticmethod
     def _safe_stat(path: Path, attribute: str) -> int | float:
@@ -1191,7 +1350,7 @@ class MtpOrderTransfer:
                 self.drag_overlay.attributes("-disabled", True)
             except tk.TclError:
                 pass
-            self.drag_hint = tk.Label(self.drag_overlay, justify="left", anchor="w", padx=9, pady=4,
+            self.drag_hint = tk.Label(self.drag_overlay, justify="left", anchor="w", padx=_px(9), pady=_px(4),
                                       text="", background="#FFFFFF", foreground="#202020",
                                       relief="solid", borderwidth=1, font=("Segoe UI", 9))
             self.drag_hint.pack()
@@ -1216,8 +1375,8 @@ class MtpOrderTransfer:
         self.drag_hint.config(text=self.dragged_preview_path.name)
         overlay_width = max(230, self.drag_overlay.winfo_reqwidth())
         overlay_height = self.drag_overlay.winfo_reqheight()
-        x = min(event.x_root + 18, self.root.winfo_screenwidth() - overlay_width - 8)
-        y = min(event.y_root + 18, self.root.winfo_screenheight() - overlay_height - 8)
+        x = min(event.x_root + _px(18), self.root.winfo_screenwidth() - overlay_width - _px(8))
+        y = min(event.y_root + _px(18), self.root.winfo_screenheight() - overlay_height - _px(8))
         self.drag_overlay.geometry(f"+{max(0, x)}+{max(0, y)}")
         self._place_drop_marker(rows)
 
@@ -1230,7 +1389,7 @@ class MtpOrderTransfer:
                 self.drop_marker.attributes("-disabled", True)
             except tk.TclError:
                 pass
-            marker = tk.Frame(self.drop_marker, background="#1473E6", height=3)
+            marker = tk.Frame(self.drop_marker, background="#1473E6", height=_px(3))
             marker.pack(fill="x")
         index = self.drop_insert_index or 0
         if rows and index < len(rows):
@@ -1242,7 +1401,7 @@ class MtpOrderTransfer:
         else:
             y = self.preview.winfo_rooty() + 2
         width = max(1, self.preview.winfo_width() - 4)
-        self.drop_marker.geometry(f"{width}x3+{self.preview.winfo_rootx()+2}+{y-1}")
+        self.drop_marker.geometry(f"{width}x{_px(3)}+{self.preview.winfo_rootx()+_px(2)}+{y-_px(1)}")
 
     def _preview_drag_end(self, event: tk.Event) -> None:
         source_row = self.dragged_preview_row
@@ -1322,7 +1481,6 @@ class MtpOrderTransfer:
     def _transfer(self) -> None:
         if not self.folder_tree.selection() or not self.source_files:
             return
-        self._update_preview()
         target_id = int(self.folder_tree.selection()[0])
         target = next((f for f in self.folders if int(f["id"]) == target_id), None)
         if not target:
@@ -1561,6 +1719,8 @@ class MtpOrderTransfer:
 
 
 if __name__ == "__main__":
+    _configure_windows_dpi_scaling()
     window = tk.Tk()
+    _configure_tk_dpi(window)
     app = MtpOrderTransfer(window)
     window.mainloop()
